@@ -1,0 +1,5 @@
+discord.py==2.3.2
+aiohttp==3.9.1
+rustplus==6.0.9
+rustPlusPushReceiver==0.6.1
+betterproto==2.0.0b7
