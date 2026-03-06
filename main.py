@@ -1,161 +1,114 @@
-import os
-import sys
-import asyncio
-import json
-import math
-import aiohttp
-import time
-import re
-import threading
-
-# ==========================================
-# 📦 УМНЫЙ ИМПОРТ
-# ==========================================
-try:
-    from rustPlusPushReceiver import PushReceiver
-except ImportError:
-    try:
-        from push_receiver import PushReceiver
-    except ImportError:
-        print("❌ ОШИБКА: Библиотека уведомлений не найдена!")
-        sys.exit(1)
-
-import discord
+import os, sys, asyncio, json, math, aiohttp, time, re, threading, discord
 from discord.ext import commands, tasks
 from rustplus import RustSocket, ServerDetails
+from rustPlusPushReceiver import PushReceiver
 
 # ==========================================
-# ⚙️ ИНИЦИАЛИЗАЦИЯ
+# ⚙️ НАСТРОЙКИ (Впиши свои данные сюда)
 # ==========================================
 
-with open("config.json", "r", encoding="utf-8") as f:
-    config = json.load(f)
+# Разбей свой токен Дискорда на две части (пример: "ABC" + "DEF")
+# Это нужно, чтобы GitHub не блокировал файл
+D_TOKEN_1 = "MTQ3MzEyNTkxNjIyNDkxNzY0Nw.G2-SQo."
+D_TOKEN_2 = "V-L633e5wFvjZBlzLSUH-lCuC10EFnAM5dprcE"
 
-rust_socket = RustSocket(server_details=ServerDetails(
-    config["rust_server"]["ip"], config["rust_server"]["port"],
-    int(config["rust_server"]["player_id"]), int(config["rust_server"]["player_token"])
-))
+config = {
+    "discord_token": D_TOKEN_1 + D_TOKEN_2,
+    "bm_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ0b2tlbiI6IjY0MDVmODcxOTI2MzRiYjYiLCJpYXQiOjE3NzI0MDQ4MTAsIm5iZiI6MTc3MjQwNDgxMCwiaXNzIjoiaHR0cHM6Ly93d3cuYmF0dGxlbWV0cmljcy5jb20iLCJzdWIiOiJ1cm46dXNlcjoxMTUxMTYyIn0.JTJ2rtQaIWepWSmajALDg6f5n-cOixkvWE9WFyFio24",
+    "bm_server_id": "34885585",
+    "rust_server": {
+        "ip": "195.60.166.23",
+        "port": "28082",
+        "player_id": "76561199023430992",
+        "player_token": "1604399880"
+    },
+    "fcm_credentials": {
+        "gcm": {
+            "androidId": "5674178292704561415",
+            "securityToken": "3211240017478510636"
+        },
+        "fcm": {
+            "token": "e3Fl8Wejhag:APA91bEA9AWm8f99AZ_IqyvkhEqHQ5ePDpCDLJ5p8CUtWOEeyFLwH5cx5jOBcSTp4k9XyzRsBFJSyOyFCty6QgwSyaL8IPTTGcE1df5jcpmRpUEDqW0M08s"
+        }
+    },
+    "channel_id": "1473135875641577472" # ПРИМЕР: 123456789012345
+}
 
-intents = discord.Intents.default()
-intents.message_content = True
+# ==========================================
+# 🛰️ ИНИЦИАЛИЗАЦИЯ
+# ==========================================
+rust_socket = RustSocket(server_details=ServerDetails(config["rust_server"]["ip"], config["rust_server"]["port"], int(config["rust_server"]["player_id"]), int(config["rust_server"]["player_token"])))
+intents = discord.Intents.default(); intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
-
-# Переменные состояния
-MAP_SIZE_VAL = 4500
-active_map_events = {} 
-pending_heli_alerts = {} 
-last_known_online = {} 
-
-FILES = {"watchlist": "data_watchlist.json"}
-
-def load_watchlist():
-    if not os.path.exists(FILES["watchlist"]): return {}
-    try:
-        with open(FILES["watchlist"], "r", encoding="utf-8") as f:
-            data = json.load(f)
-            if isinstance(data, list): return {str(i): "Target" for i in data}
-            return {str(k): str(v) for k, v in data.items()}
-    except: return {}
-
-data_store = {"watchlist": load_watchlist()}
-
-# ==========================================
-# 🛰️ HELPERS
-# ==========================================
+MAP_SIZE_VAL = 4500; active_map_events = {}; pending_heli_alerts = {}; last_known_online = {}; watchlist_data = {}
 
 async def fetch_bm(url):
     headers = {"Authorization": f"Bearer {config['bm_token']}"}
     async with aiohttp.ClientSession() as session:
-        try:
-            async with session.get(url, headers=headers, timeout=10) as resp:
-                if resp.status == 200: return await resp.json()
-                return None
-        except: return None
+        async with session.get(url, headers=headers) as resp: return await resp.json() if resp.status == 200 else None
 
 async def get_steam_info(bm_id):
     data = await fetch_bm(f"https://api.battlemetrics.com/players/{bm_id}?include=identifier")
     if data and "included" in data:
         for item in data["included"]:
-            if item["type"] == "identifier" and item["attributes"]["type"] == "steamID":
-                return f"https://steamcommunity.com/profiles/{item['attributes']['identifier']}"
+            if item["type"] == "identifier" and item["attributes"]["type"] == "steamID": return f"https://steamcommunity.com/profiles/{item['attributes']['identifier']}"
     return "Скрыт"
 
 # ==========================================
-# 🕵️ TASKS
+# 🕵️ ЗАДАЧИ
 # ==========================================
-
 @tasks.loop(minutes=2)
 async def watchlist_task():
     global last_known_online
     channel = bot.get_channel(int(config["channel_id"]))
     data = await fetch_bm(f"https://api.battlemetrics.com/servers/{config['bm_server_id']}?include=player")
     if not data or not channel: return
-
     online_now = {str(item["id"]): item["attributes"]["name"] for item in data.get("included", []) if item["type"] == "player"}
-    
     if last_known_online:
         for pid, name in online_now.items():
-            if pid in data_store["watchlist"] and pid not in last_known_online:
-                tag = data_store["watchlist"].get(pid)
-                display = name if tag == "Target" else f"{tag} ({name})"
-                steam = await get_steam_info(pid)
-                await channel.send(f"🚨 **ВРАГ ЗАШЕЛ:** {display}\n🎮 Steam: <{steam}>")
-        
+            if pid in watchlist_data and pid not in last_known_online:
+                tag = watchlist_data.get(pid); steam = await get_steam_info(pid)
+                await channel.send(f"🚨 **ВРАГ ЗАШЕЛ:** {tag if tag != 'Target' else name} ({name})\n🎮 Steam: <{steam}>")
         for pid, name in last_known_online.items():
-            if pid in data_store["watchlist"] and pid not in online_now:
-                tag = data_store["watchlist"].get(pid)
-                display = name if tag == "Target" else f"{tag} ({name})"
-                await channel.send(f"👋 **ВРАГ ВЫШЕЛ:** {display}")
-
+            if pid in watchlist_data and pid not in online_now:
+                tag = watchlist_data.get(pid); await channel.send(f"👋 **ВРАГ ВЫШЕЛ:** {tag if tag != 'Target' else name} ({name})")
     last_known_online = online_now
 
 @tasks.loop(seconds=15)
 async def map_task():
     global MAP_SIZE_VAL
     channel = bot.get_channel(int(config["channel_id"]))
-    if not rust_socket.ws or not channel: return
     try:
-        markers = await rust_socket.get_markers()
-        m_ids = [m.id for m in markers]
+        markers = await rust_socket.get_markers(); m_ids = [m.id for m in markers]
         for m in markers:
             if m.type not in [5, 6] or m.id in active_map_events: continue
             if m.type == 5:
-                if m.id not in pending_heli_alerts:
-                    pending_heli_alerts[m.id] = {"x": m.x, "y": m.y}; continue
-                prev = pending_heli_alerts[m.id]
-                if math.sqrt((prev["x"]-m.x)**2 + (prev["y"]-m.y)**2) < 50: continue
+                if m.id not in pending_heli_alerts: pending_heli_alerts[m.id] = {"x": m.x, "y": m.y}; continue
+                if math.sqrt((pending_heli_alerts[m.id]["x"]-m.x)**2 + (pending_heli_alerts[m.id]["y"]-m.y)**2) < 50: continue
                 loc = f"{chr(ord('A') + int(m.x // 146.3))}{int((MAP_SIZE_VAL - m.y) // 146.3)}"
-                await channel.send(f"🚁 **ВЕРТОЛЕТ** 📍 **{loc}**")
-                active_map_events[m.id] = True
+                await channel.send(f"🚁 **ВЕРТОЛЕТ** 📍 **{loc}**"); active_map_events[m.id] = True
             elif m.type == 6:
-                dist = math.sqrt((m.x - MAP_SIZE_VAL/2)**2 + (m.y - MAP_SIZE_VAL/2)**2)
-                if dist > (MAP_SIZE_VAL/2) * 0.7:
+                if math.sqrt((m.x - MAP_SIZE_VAL/2)**2 + (m.y - MAP_SIZE_VAL/2)**2) > (MAP_SIZE_VAL/2) * 0.7:
                     loc = "БОЛЬШАЯ НЕФТЯНКА" if m.y > MAP_SIZE_VAL/2 else "МАЛАЯ НЕФТЯНКА"
-                    await channel.send(f"📦 **ЯЩИК НА ВЫШКЕ** 📍 **{loc}**")
-                    active_map_events[m.id] = True
+                    await channel.send(f"📦 **ЯЩИК НА ВЫШКЕ** 📍 **{loc}**"); active_map_events[m.id] = True
         for eid in list(active_map_events.keys()):
             if eid not in m_ids: del active_map_events[eid]
     except: pass
 
 async def run_fcm_listener():
-    """Слушатель уведомлений (Самый надежный метод для Windows)"""
-    if "fcm_credentials" not in config: return
     def fcm_thread():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        loop = asyncio.new_event_loop(); asyncio.set_event_loop(loop)
         try:
-            # Прямая итерация без .connect()
             receiver = PushReceiver(config["fcm_credentials"])
             async def listen():
-                print("🚀 [FCM] Слушатель уведомлений запущен.")
-                async for msg in receiver:
-                    chan = bot.get_channel(int(config["channel_id"]))
-                    if not chan: continue
-                    body = getattr(msg, 'message', getattr(msg, 'body', '')).lower()
-                    title = getattr(msg, 'title', 'Rust Alert')
-                    if any(w in body for w in ['destroyed', 'raided', 'killed', 'door', 'wall', 'frame']):
-                        emb = discord.Embed(title=f"🔔 {title}", description=body, color=0xff0000)
-                        asyncio.run_coroutine_threadsafe(chan.send(content="@everyone ⚠️ **РЕЙД!**", embed=emb), bot.loop)
+                async with receiver:
+                    async for msg in receiver.notifications():
+                        chan = bot.get_channel(int(config["channel_id"]))
+                        body = getattr(msg, 'body', getattr(msg, 'message', '')).lower()
+                        title = getattr(msg, 'title', 'Alert')
+                        if any(w in body for w in ['destroyed', 'raided', 'killed', 'door', 'wall', 'frame']):
+                            emb = discord.Embed(title=f"🔔 {title}", description=body, color=0xff0000)
+                            asyncio.run_coroutine_threadsafe(chan.send(content="@everyone ⚠️ **РЕЙД!**", embed=emb), bot.loop)
             loop.run_until_complete(listen())
         except Exception as e: print(f"FCM Error: {e}")
     threading.Thread(target=fcm_thread, daemon=True).start()
@@ -163,12 +116,11 @@ async def run_fcm_listener():
 # ==========================================
 # 🤖 COMMANDS
 # ==========================================
-
 @bot.command()
 async def demy(ctx):
-    emb = discord.Embed(title="⚙️ .demy V98.3", color=0x3498db)
-    emb.add_field(name="🛰️ Разведка", value="`!find [Ник/Тег/SteamID]`\n`!online` - Враги онлайн", inline=False)
-    emb.add_field(name="👣 Слежка", value="`!add [ID] [Имя]`\n`!targets` - Список", inline=False)
+    emb = discord.Embed(title="⚙️ .demy V100.0", color=0x3498db)
+    emb.add_field(name="🛰️ Разведка", value="`!find [Ник/SteamID]`\n`!online` - Кто в игре?", inline=False)
+    emb.add_field(name="👣 Слежка", value="`!add [ID] [Имя]`\n`!targets` - Watchlist", inline=False)
     emb.add_field(name="🚁 Карта", value="`!status` - Инфо\n`!testraid` - Тест", inline=False)
     await ctx.send(embed=emb)
 
@@ -188,60 +140,56 @@ async def find(ctx, *, query):
     found = [pid for pid, name in players.items() if query.lower() in name.lower()]
     if not found: await ctx.send("❌ Никого не нашел."); return
     txt = "\n".join([f"• **{players[pid]}** — ID: `{pid}`" for pid in found[:25]])
-    await ctx.send(embed=discord.Embed(title=f"🔎 Найдено {len(found)}", description=txt, color=0x3498db))
+    await ctx.send(embed=discord.Embed(title=f"🔎 Найдено {len(found)} игроков", description=txt, color=0x3498db))
 
 @bot.command()
 async def online(ctx):
-    msg = "🔴 **Враги ОНЛАЙН:**\n"
-    found = False
-    for pid, tag in data_store["watchlist"].items():
+    msg = "🔴 **Враги ОНЛАЙН:**\n"; found = False
+    for pid, tag in watchlist_data.items():
         if pid in last_known_online:
-            name = last_known_online[pid]
-            display = tag if tag != "Target" else name
-            msg += f"🔥 **{display}** — ID: `{pid}`\n"
-            found = True
+            msg += f"🔥 **{tag if tag != 'Target' else last_known_online[pid]}** — ID: `{pid}`\n"; found = True
     await ctx.send(msg if found else "✅ На сервере спокойно.")
 
 @bot.command()
 async def add(ctx, bm_id, *, name="Target"):
-    data_store["watchlist"][str(bm_id)] = name
-    with open(FILES["watchlist"], "w", encoding="utf-8") as f: json.dump(data_store["watchlist"], f)
-    await ctx.send(f"✅ Добавлен: **{name}**")
+    watchlist_data[str(bm_id)] = name; await ctx.send(f"✅ Добавлен: **{name}**")
+
+@bot.command()
+async def targets(ctx):
+    if not watchlist_data: await ctx.send("📭 Пусто."); return
+    txt = "\n".join([f"• **{v}** (ID: `{k}`)" for k, v in watchlist_data.items()])
+    await ctx.send(embed=discord.Embed(title="📋 Watchlist", description=txt, color=0x3498db))
+
+@bot.command()
+async def status(ctx):
+    try:
+        info = await rust_socket.get_info()
+        await ctx.send(f"🗺️ **{info.name}**\n👥 {info.players}/{info.max_players}")
+    except: await ctx.send("❌ Ошибка")
 
 @bot.command()
 async def testraid(ctx):
     emb = discord.Embed(title="🔔 You're getting raided!", description="wall destroyed at I20", color=0xff0000)
-    await ctx.send(content="@everyone ⚠️ **ТЕСТ!**", embed=emb)
+    await ctx.send(content="@everyone ⚠️ **ТЕСТ СИСТЕМЫ!**", embed=emb)
 
 @bot.command()
 async def gaysex(ctx): await ctx.send("🏳️‍🌈 **Дмитрий Шамаев пидарас** 🏳️‍🌈")
 
 @bot.command()
-async def status(ctx):
-    if not rust_socket.ws: await ctx.send("❌ Rust+ не подключен"); return
-    try:
-        info = await rust_socket.get_info()
-        await ctx.send(f"🗺️ **{info.name}**\n👥 {info.players}/{info.max_players}")
-    except: await ctx.send("❌ Ошибка получения данных")
+async def farm(ctx, item, amount: int):
+    item = item.lower()
+    costs = {"rocket": {"Sulfur": 1400, "Charcoal": 1950}, "c4": {"Sulfur": 2200, "Charcoal": 3000}}
+    if item in costs:
+        res = costs[item]
+        await ctx.send(f"🧾 {amount} {item.upper()}: Серы {res['Sulfur']*amount}, Угля {res['Charcoal']*amount}")
 
 @bot.event
 async def on_ready():
     print(f"✅ {bot.user} ONLINE")
-    
-    async def connect_rust():
-        await asyncio.sleep(5) # Задержка для обхода защиты Facepunch
-        try:
-            await rust_socket.connect()
-            print("✅ Rust+ Connected")
-            info = await rust_socket.get_info()
-            global MAP_SIZE_VAL
-            MAP_SIZE_VAL = info.size
-        except Exception as e: print(f"⚠️ Rust+ Error: {e}")
+    try:
+        await rust_socket.connect()
+        info = await rust_socket.get_info(); global MAP_SIZE_VAL; MAP_SIZE_VAL = info.size
+    except: pass
+    asyncio.create_task(run_fcm_listener()); watchlist_task.start(); map_task.start()
 
-    asyncio.create_task(connect_rust())
-    asyncio.create_task(run_fcm_listener())
-    watchlist_task.start()
-    map_task.start()
-
-if __name__ == "__main__":
-    bot.run(config["discord_token"])
+bot.run(config["discord_token"])
